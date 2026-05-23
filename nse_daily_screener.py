@@ -50,13 +50,11 @@ NIFTY250 = [x for x in NIFTY250 if not (x in seen or seen.add(x))]
 # ── NSE URL templates ─────────────────────────────────────────────────────────
 # New CM-UDiFF format (post July 2024)
 BHAVCOPY_NEW = (
-    "https://nsearchives.nseindia.com/content/cm/"
-    "BhavCopy_NSE_CM_0_0_0_{date}_F_0000.csv.zip"
+    "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{date_str}_F_0000.csv.zip"
 )
 # Legacy fallback
 BHAVCOPY_OLD = (
-    "https://archives.nseindia.com/content/historical/EQUITIES/"
-    "{year}/{mon}/cm{date2}bhav.csv.zip"
+    "https://archives.nseindia.com/content/historical/EQUITIES/{year}/{mon}/cm{date2}bhav.csv.zip"
 )
 
 HEADERS = {
