@@ -2,8 +2,8 @@ name: NSE Daily Screener
 
 on:
   schedule:
-    - cron: "45 10 * * 1-5"   # 4:15 PM IST every weekday
-  workflow_dispatch:            # Manual trigger anytime
+    - cron: "45 10 * * 1-5"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,18 +36,22 @@ jobs:
       - name: Run screener
         run: python nse_daily_screener.py
 
-      - name: Copy index.html to docs/
+      - name: Setup docs folder
         run: |
           mkdir -p docs
-          cp index.html docs/index.html
-
-      - name: Verify output files exist
-        run: |
+          # Copy index.html - check both locations
+          if [ -f "index.html" ]; then
+            cp index.html docs/index.html
+            echo "Copied index.html from root to docs/"
+          elif [ -f "docs/index.html" ]; then
+            echo "index.html already in docs/"
+          else
+            echo "WARNING: index.html not found!"
+          fi
           echo "=== docs/ contents ==="
           ls -lh docs/
-          echo "=== JSON preview (first 500 chars) ==="
-          head -c 500 docs/screener_data.json
-          echo ""
+          echo "=== JSON first 300 chars ==="
+          head -c 300 docs/screener_data.json || echo "screener_data.json missing!"
 
       - name: Commit and push docs/
         run: |
@@ -55,7 +59,7 @@ jobs:
           git config user.email "bot@nse-screener.local"
           git add docs/
           git status
-          git diff --staged --quiet || git commit -m "data: screener update $(date +'%Y-%m-%d %H:%M')"
+          git diff --staged --quiet || git commit -m "data: screener $(date +'%Y-%m-%d %H:%M IST')"
           git push origin HEAD
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -67,5 +71,3 @@ jobs:
           publish_dir: ./docs
           publish_branch: gh-pages
           keep_files: true
-          commit_message: "deploy: screener $(date +'%Y-%m-%d')"
-
