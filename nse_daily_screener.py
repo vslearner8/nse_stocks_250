@@ -1,23 +1,32 @@
 """
-NSE Nifty 250 Daily DMA Screener
-Downloads NSE CM-UDiFF Bhavcopy, calculates DMA 50/100/200,
-screens stocks, outputs Excel + JSON for the live dashboard.
+NSE Nifty 250 Daily DMA Screener - RELIABLE VERSION
+=====================================================
+Uses Yahoo Finance (yfinance) as primary data source.
+- No NSE cookie/session issues
+- Works 100% reliably in GitHub Actions
+- Gets real closing prices + calculates DMA 50/100/200
+
+Install: pip install yfinance pandas openpyxl requests
 """
 
-import os, io, zipfile, json, time, requests, pandas as pd
+import os, json, time, warnings
+import pandas as pd
 from datetime import datetime, timedelta
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# ── Config ────────────────────────────────────────────────────────────────────
-DOCS_DIR    = "./docs"
-HISTORY_DIR = "./nse_history"
-HIGH_VOL_MULTIPLIER     = 1.5
-HIGH_VALUE_CRORE        = 5
-DMA200_OVEREXTENDED_PCT = 10
+warnings.filterwarnings("ignore")
 
-NIFTY250 = [
+# ── Config ────────────────────────────────────────────────────────────────────
+DOCS_DIR               = "./docs"
+HIGH_VOL_MULTIPLIER    = 1.5
+HIGH_VALUE_CRORE       = 5
+DMA200_OVEREXTENDED_PCT= 10
+HISTORY_DAYS           = 220   # need 200 for DMA200 + buffer
+
+# ── Nifty 250 symbols (Yahoo Finance format = NSE symbol + ".NS") ─────────────
+NIFTY250_NSE = [
     "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","SBIN","BHARTIARTL",
     "ITC","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI","BAJFINANCE","TITAN",
     "NESTLEIND","WIPRO","ULTRACEMCO","TECHM","SUNPHARMA","POWERGRID","NTPC","ONGC",
@@ -38,203 +47,153 @@ NIFTY250 = [
     "RAMCOCEM","RECLTD","RELAXO","SBICARD","SCHAEFFLER","SRF","STARHEALTH",
     "SUNTV","SUPREMEIND","SYNGENE","TATACOMM","TORNTPOWER","TRENT","UNIONBANK",
     "UPL","VGUARD","YESBANK","ZEEL","SUNDARMFIN","LATENTVIEW","ANGELONE",
-    "KAYNES","MAPMYINDIA","METRO","RRKABEL","UTIAMC","RITES","DEEPAKNTR",
-    "NAVINFLUOR","GNFC","GMRINFRA","LINDEINDIA","MFSL","PIIND","RAYMOND",
-    "TATACONSUM","TORNTPHARM","VEDL","WHIRLPOOL","ABCAPITAL","CHOLAFIN",
+    "KAYNES","MAPMYINDIA","METRO","RRKABEL","UTIAMC","RITES","NAVINFLUOR",
+    "GNFC","LINDEINDIA","MFSL","RAYMOND","WHIRLPOOL","ABCAPITAL","PIIND",
+    "NMDC","NHPC","NBCC","RECLTD","GMRINFRA","HAL","BEL","RVNL","IRFC",
+    "PFC","HUDCO","SJVN","NTPC","COALINDIA","ONGC","IOC","BPCL","HINDPETRO",
 ]
 
-# Remove duplicates while preserving order
+# Deduplicate
 seen = set()
-NIFTY250 = [x for x in NIFTY250 if not (x in seen or seen.add(x))]
+NIFTY250_NSE = [x for x in NIFTY250_NSE if not (x in seen or seen.add(x))]
 
-# ── NSE URL templates ─────────────────────────────────────────────────────────
-# New CM-UDiFF format (post July 2024)
-BHAVCOPY_NEW = (
-    "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{date_str}_F_0000.csv.zip"
-)
-# Legacy fallback
-BHAVCOPY_OLD = (
-    "https://archives.nseindia.com/content/historical/EQUITIES/{year}/{mon}/cm{date2}bhav.csv.zip"
-)
+# Convert to Yahoo Finance tickers (append .NS)
+def to_yf_ticker(sym):
+    # Special cases
+    special = {"M&M": "M&M.NS", "BAJAJ-AUTO": "BAJAJ-AUTO.NS"}
+    return special.get(sym, f"{sym}.NS")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Encoding": "gzip, deflate, br",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-    "Referer": "https://www.nseindia.com/",
-    "sec-ch-ua": '"Chromium";v="124"',
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "same-origin",
-}
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def last_trading_day(ref=None):
-    d = ref or datetime.today()
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
-
-def get_nse_session():
-    """Create a session with valid NSE cookies."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
+# ── Step 1: Download historical data via yfinance ─────────────────────────────
+def fetch_all_data():
     try:
-        # Hit home page first to get cookies
-        session.get("https://www.nseindia.com", timeout=15)
-        time.sleep(2)
-        # Hit market data page (sets additional cookies)
-        session.get("https://www.nseindia.com/market-data/all-reports", timeout=15)
-        time.sleep(1)
-    except Exception as e:
-        print(f"  ⚠ Session setup warning: {e}")
-    return session
+        import yfinance as yf
+    except ImportError:
+        raise ImportError("Run: pip install yfinance")
 
-def download_bhavcopy(date_obj, session=None):
-    date_str  = date_obj.strftime("%Y%m%d")
-    cache     = os.path.join(HISTORY_DIR, f"bhav_{date_str}.csv")
-    if os.path.exists(cache):
-        return pd.read_csv(cache)
+    print("\n[1/3] Downloading data from Yahoo Finance…")
 
-    os.makedirs(HISTORY_DIR, exist_ok=True)
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=int(HISTORY_DAYS * 1.6))  # extra buffer for weekends/holidays
 
-    if session is None:
-        session = get_nse_session()
+    tickers = [to_yf_ticker(s) for s in NIFTY250_NSE]
 
-    # Try new URL format first
-    url = BHAVCOPY_NEW.format(date=date_str)
-    print(f"  ↓ {url}")
-    try:
-        resp = session.get(url, timeout=30)
-        if resp.status_code == 200 and len(resp.content) > 500:
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-                csv_name = [n for n in z.namelist() if n.endswith(".csv")][0]
-                df = pd.read_csv(z.open(csv_name))
-            df.to_csv(cache, index=False)
-            return df
-        print(f"  ↙ New URL returned {resp.status_code}, trying legacy…")
-    except Exception as e:
-        print(f"  ↙ New URL error: {e}, trying legacy…")
+    print(f"  Fetching {len(tickers)} stocks × {HISTORY_DAYS} days…")
 
-    # Legacy fallback URL
-    try:
-        mon   = date_obj.strftime("%b").upper()
-        year  = date_obj.strftime("%Y")
-        date2 = date_obj.strftime("%d%b%Y").upper()
-        url2  = BHAVCOPY_OLD.format(year=year, mon=mon, date2=date2)
-        print(f"  ↓ {url2}")
-        resp2 = session.get(url2, timeout=30)
-        if resp2.status_code == 200:
-            with zipfile.ZipFile(io.BytesIO(resp2.content)) as z:
-                csv_name = [n for n in z.namelist() if n.endswith(".csv")][0]
-                df = pd.read_csv(z.open(csv_name))
-            df.to_csv(cache, index=False)
-            return df
-    except Exception as e2:
-        print(f"  ✗ Legacy URL error: {e2}")
+    # Download in batches of 50 to avoid timeouts
+    all_close  = {}
+    all_volume = {}
+    all_today  = {}
 
-    raise Exception(f"Failed to download bhavcopy for {date_str}")
+    BATCH = 50
+    for i in range(0, len(tickers), BATCH):
+        batch = tickers[i:i+BATCH]
+        batch_syms = NIFTY250_NSE[i:i+BATCH]
+        print(f"  Batch {i//BATCH + 1}/{(len(tickers)-1)//BATCH + 1}: {batch_syms[0]}…{batch_syms[-1]}")
 
-def normalise(df):
-    """Normalise column names across old and new bhavcopy formats."""
-    df.columns = [c.strip().upper().replace(" ", "") for c in df.columns]
-    rename = {
-        # New format → standard
-        "TCKRSYMB":    "SYMBOL",
-        "CLSPRIC":     "CLOSE",
-        "OPNPRIC":     "OPEN",
-        "HGHPRIC":     "HIGH",
-        "LWPRIC":      "LOW",
-        "PRVSCLSGPRIC":"PREVCLOSE",
-        "TTLTRADGVOL": "VOLUME",
-        "TTLTRFVAL":   "VALUE",
-        "SCTYSRS":     "SERIES",
-        # Old format already uses SYMBOL, CLOSE etc — no rename needed
-    }
-    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-    return df
-
-def build_history(today, days=210):
-    print(f"\n[2/4] Building {days}-day price history…")
-    session = get_nse_session()
-    closes  = {}
-    date    = today
-    count   = 0
-    fails   = 0
-    while count < days and fails < 20:
         try:
-            df  = download_bhavcopy(date, session)
-            df  = normalise(df)
-            eq  = df[df["SERIES"] == "EQ"].copy() if "SERIES" in df.columns else df.copy()
-            if "SYMBOL" in eq.columns and "CLOSE" in eq.columns:
-                eq["CLOSE"] = pd.to_numeric(eq["CLOSE"], errors="coerce")
-                closes[date.strftime("%Y%m%d")] = eq.set_index("SYMBOL")["CLOSE"]
-                count += 1
-                fails = 0
-            else:
-                print(f"    ⚠ Missing cols in {date.strftime('%Y%m%d')}: {list(df.columns[:8])}")
-                fails += 1
+            raw = yf.download(
+                batch,
+                start=start_date.strftime("%Y-%m-%d"),
+                end=end_date.strftime("%Y-%m-%d"),
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+            )
+
+            for sym, ticker in zip(batch_syms, batch):
+                try:
+                    if len(batch) == 1:
+                        close_series  = raw["Close"]
+                        volume_series = raw["Volume"]
+                        high_series   = raw["High"]
+                        low_series    = raw["Low"]
+                        open_series   = raw["Open"]
+                    else:
+                        if ticker not in raw.columns.get_level_values(0):
+                            continue
+                        close_series  = raw[ticker]["Close"]
+                        volume_series = raw[ticker]["Volume"]
+                        high_series   = raw[ticker]["High"]
+                        low_series    = raw[ticker]["Low"]
+                        open_series   = raw[ticker]["Open"]
+
+                    close_series  = close_series.dropna()
+                    volume_series = volume_series.dropna()
+
+                    if len(close_series) < 10:
+                        print(f"    ⚠ {sym}: not enough data ({len(close_series)} rows)")
+                        continue
+
+                    all_close[sym]  = close_series
+                    all_volume[sym] = volume_series
+
+                    # Today's (last available) data
+                    last_date = close_series.index[-1]
+                    all_today[sym] = {
+                        "ltp":       round(float(close_series.iloc[-1]), 2),
+                        "prevClose": round(float(close_series.iloc[-2]), 2) if len(close_series) >= 2 else 0,
+                        "high":      round(float(high_series.loc[last_date]),   2) if last_date in high_series.index   else 0,
+                        "low":       round(float(low_series.loc[last_date]),    2) if last_date in low_series.index    else 0,
+                        "open":      round(float(open_series.loc[last_date]),   2) if last_date in open_series.index   else 0,
+                        "volume":    int(float(volume_series.loc[last_date]))       if last_date in volume_series.index else 0,
+                        "date":      last_date.strftime("%Y-%m-%d"),
+                    }
+                except Exception as e:
+                    print(f"    ⚠ {sym}: {e}")
+                    continue
+
         except Exception as e:
-            print(f"    skip {date.strftime('%Y%m%d')}: {e}")
-            fails += 1
-        date -= timedelta(days=1)
-        while date.weekday() >= 5:
-            date -= timedelta(days=1)
-        time.sleep(0.3)  # be polite to NSE servers
-
-    price_df = pd.DataFrame(closes).T.sort_index()
-    price_df = price_df.apply(pd.to_numeric, errors="coerce")
-    print(f"  ✓ {len(price_df)} days × {len(price_df.columns)} symbols")
-    return price_df, session
-
-def screen(today, price_df, session):
-    print("\n[3/4] Screening…")
-    bhav = download_bhavcopy(today, session)
-    bhav = normalise(bhav)
-
-    eq = bhav[bhav.get("SERIES", bhav.iloc[:, 0]) == "EQ"].copy() \
-         if "SERIES" in bhav.columns else bhav.copy()
-    eq = eq.set_index("SYMBOL")
-
-    for col in ["CLOSE","PREVCLOSE","HIGH","LOW","VOLUME","VALUE"]:
-        if col in eq.columns:
-            eq[col] = pd.to_numeric(eq[col], errors="coerce")
-
-    records = []
-    for sym in NIFTY250:
-        if sym not in eq.index:
+            print(f"  ✗ Batch error: {e}")
             continue
-        r   = eq.loc[sym]
-        ltp = float(r.get("CLOSE",     0) or 0)
-        prv = float(r.get("PREVCLOSE", 0) or 0)
-        vol = float(r.get("VOLUME",    0) or 0)
-        val = float(r.get("VALUE",     0) or 0)
-        hgh = float(r.get("HIGH",      0) or 0)
-        low = float(r.get("LOW",       0) or 0)
+
+        time.sleep(1)  # be polite
+
+    print(f"  ✓ Got data for {len(all_today)} / {len(NIFTY250_NSE)} stocks")
+    return all_close, all_volume, all_today
+
+# ── Step 2: Calculate DMAs and screen ─────────────────────────────────────────
+def screen(all_close, all_volume, all_today):
+    print("\n[2/3] Calculating DMAs and screening…")
+    records = []
+
+    for sym in NIFTY250_NSE:
+        if sym not in all_today:
+            continue
+
+        td  = all_today[sym]
+        ltp = td["ltp"]
+        prv = td["prevClose"]
+        vol = td["volume"]
+        hgh = td["high"]
+        low = td["low"]
 
         chg     = round(ltp - prv, 2)
         chg_pct = round((chg / prv * 100) if prv else 0, 2)
 
-        hist    = price_df[sym].dropna() if sym in price_df.columns else pd.Series(dtype=float)
-        dma50   = round(hist.tail(50).mean(),  2) if len(hist) >= 50  else None
-        dma100  = round(hist.tail(100).mean(), 2) if len(hist) >= 100 else None
-        dma200  = round(hist.tail(200).mean(), 2) if len(hist) >= 200 else None
-        avg_vol = hist.tail(20).mean() if len(hist) >= 20 else 0
+        # Close price history for DMA
+        hist = all_close.get(sym, pd.Series(dtype=float)).dropna()
+        # Remove today from history for DMA calc (use only historical closes)
+        hist_for_dma = hist.iloc[:-1] if len(hist) > 1 else hist
 
-        a50    = bool(ltp > dma50)  if dma50  else False
-        a100   = bool(ltp > dma100) if dma100 else False
-        a200   = bool(ltp > dma200) if dma200 else False
-        pct200 = round((ltp - dma200) / dma200 * 100, 2) if dma200 else None
-        hi_vol = bool(vol > avg_vol * HIGH_VOL_MULTIPLIER) if avg_vol else False
-        hi_val = bool((val / 1e7) >= HIGH_VALUE_CRORE)
-        over   = bool(pct200 > DMA200_OVEREXTENDED_PCT) if pct200 is not None else False
+        dma50   = round(float(hist_for_dma.tail(50).mean()),  2) if len(hist_for_dma) >= 50  else None
+        dma100  = round(float(hist_for_dma.tail(100).mean()), 2) if len(hist_for_dma) >= 100 else None
+        dma200  = round(float(hist_for_dma.tail(200).mean()), 2) if len(hist_for_dma) >= 200 else None
+
+        # Average volume (20-day)
+        vol_hist  = all_volume.get(sym, pd.Series(dtype=float)).dropna()
+        avg_vol   = float(vol_hist.tail(20).mean()) if len(vol_hist) >= 5 else 0
+
+        # Value in crores (approx: ltp × volume / 1Cr)
+        val_cr    = round(ltp * vol / 1e7, 2)
+
+        a50   = bool(ltp > dma50)  if dma50  else False
+        a100  = bool(ltp > dma100) if dma100 else False
+        a200  = bool(ltp > dma200) if dma200 else False
+        pct200= round((ltp - dma200) / dma200 * 100, 2) if dma200 else None
+        hi_vol= bool(vol > avg_vol * HIGH_VOL_MULTIPLIER) if avg_vol else False
+        hi_val= bool(val_cr >= HIGH_VALUE_CRORE)
+        over  = bool(pct200 > DMA200_OVEREXTENDED_PCT) if pct200 is not None else False
 
         if   a50 and a100 and a200 and hi_vol and not over: sig = "BUY"
         elif a50 and a100 and a200 and over:                sig = "OVEREXTENDED"
@@ -242,116 +201,148 @@ def screen(today, price_df, session):
         else:                                               sig = "WATCH"
 
         records.append({
-            "symbol": sym, "ltp": round(ltp,2), "prevClose": round(prv,2),
-            "change": chg, "changePct": chg_pct,
-            "high": round(hgh,2), "low": round(low,2),
-            "volume": int(vol), "avgVolume": int(avg_vol) if avg_vol else 0,
-            "highVolume": hi_vol,
-            "valueCr": round(val/1e7, 2), "highValue": hi_val,
-            "dma50": dma50,   "aboveDMA50":  a50,
-            "dma100": dma100, "aboveDMA100": a100,
-            "dma200": dma200, "aboveDMA200": a200,
-            "pctAboveDMA200": pct200,
-            "dma200Alert": "OVEREXTENDED" if over else "IN_RANGE",
-            "signal": sig,
+            "symbol":        sym,
+            "ltp":           ltp,
+            "prevClose":     prv,
+            "change":        chg,
+            "changePct":     chg_pct,
+            "high":          hgh,
+            "low":           low,
+            "volume":        vol,
+            "avgVolume":     int(avg_vol),
+            "highVolume":    hi_vol,
+            "valueCr":       val_cr,
+            "highValue":     hi_val,
+            "dma50":         dma50,
+            "aboveDMA50":    a50,
+            "dma100":        dma100,
+            "aboveDMA100":   a100,
+            "dma200":        dma200,
+            "aboveDMA200":   a200,
+            "pctAboveDMA200":pct200,
+            "dma200Alert":   "OVEREXTENDED" if over else "IN_RANGE",
+            "signal":        sig,
+            "dataDate":      td["date"],
         })
 
     df = pd.DataFrame(records)
+    if df.empty:
+        print("  ✗ No records! Check network/yfinance.")
+        return df
+
     df = df.sort_values("pctAboveDMA200", ascending=False,
                         key=lambda x: pd.to_numeric(x, errors="coerce"))
+
     buy  = (df.signal=='BUY').sum()
     hold = (df.signal=='HOLD').sum()
     ovr  = (df.signal=='OVEREXTENDED').sum()
     wtch = (df.signal=='WATCH').sum()
-    print(f"  ✓ {len(df)} stocks | BUY:{buy} HOLD:{hold} OVER:{ovr} WATCH:{wtch}")
+    print(f"  ✓ {len(df)} stocks screened")
+    print(f"     BUY:{buy}  HOLD:{hold}  OVEREXTENDED:{ovr}  WATCH:{wtch}")
+
+    # Print sample to verify correctness
+    sample = df[df.symbol.isin(["RELIANCE","TCS","HDFCBANK"])][["symbol","ltp","dma50","dma200","signal"]]
+    print(f"\n  Sample check:\n{sample.to_string(index=False)}\n")
+
     return df
 
-# ── Export JSON ───────────────────────────────────────────────────────────────
-def export_json(df, today):
+# ── Step 3a: Export JSON for dashboard ────────────────────────────────────────
+def export_json(df):
+    os.makedirs(DOCS_DIR, exist_ok=True)
     payload = {
         "generated_at": datetime.now().strftime("%d %b %Y %H:%M IST"),
-        "trading_day":  today.strftime("%d %b %Y (%A)"),
+        "trading_day":  df["dataDate"].iloc[0] if not df.empty else "N/A",
         "stocks": df.where(pd.notnull(df), None).to_dict(orient="records"),
     }
-    os.makedirs(DOCS_DIR, exist_ok=True)
     path = os.path.join(DOCS_DIR, "screener_data.json")
     with open(path, "w") as f:
         json.dump(payload, f, separators=(',', ':'))
-    print(f"  ✓ JSON → {path}")
+    size = os.path.getsize(path) / 1024
+    print(f"  ✓ JSON → {path}  ({size:.1f} KB)")
 
-# ── Export Excel ──────────────────────────────────────────────────────────────
+# ── Step 3b: Export colour-coded Excel ────────────────────────────────────────
 CLR = dict(header="0d1e3b", buy="C6EFCE", hold="FFEB9C",
            over="FFC7CE",   watch="F2F2F2", yes="E2EFDA", no="FCE4D6")
 
-def export_excel(df, today):
+def export_excel(df):
     rows = []
     for _, s in df.iterrows():
         rows.append({
-            "Symbol":        s.symbol,
-            "LTP (₹)":       s.ltp,
-            "Prev Close (₹)":s.prevClose,
-            "Change (₹)":    s.change,
-            "Change (%)":    s.changePct,
-            "High (₹)":      s.high,
-            "Low (₹)":       s.low,
-            "Volume":        s.volume,
-            "Avg Vol (20D)": s.avgVolume,
-            "High Volume":   "YES" if s.highVolume else "NO",
-            "Value (₹ Cr)":  s.valueCr,
-            "High Value":    "YES" if s.highValue else "NO",
-            "DMA 50 (₹)":    s.dma50,
-            "Above DMA 50":  "YES" if s.aboveDMA50  else "NO",
-            "DMA 100 (₹)":   s.dma100,
-            "Above DMA 100": "YES" if s.aboveDMA100 else "NO",
-            "DMA 200 (₹)":   s.dma200,
-            "Above DMA 200": "YES" if s.aboveDMA200 else "NO",
-            "% vs DMA 200":  s.pctAboveDMA200,
-            "DMA 200 Alert": "⚠ OVEREXTENDED (>10%)" if s.dma200Alert=="OVEREXTENDED" else "✓ Within Range",
-            "Signal":        s.signal,
+            "Symbol":         s.symbol,
+            "Date":           s.dataDate,
+            "LTP (₹)":        s.ltp,
+            "Prev Close (₹)": s.prevClose,
+            "Change (₹)":     s.change,
+            "Change (%)":     s.changePct,
+            "High (₹)":       s.high,
+            "Low (₹)":        s.low,
+            "Volume":         s.volume,
+            "Avg Vol (20D)":  s.avgVolume,
+            "High Volume":    "YES" if s.highVolume else "NO",
+            "Value (₹ Cr)":   s.valueCr,
+            "High Value":     "YES" if s.highValue  else "NO",
+            "DMA 50 (₹)":     s.dma50,
+            "Above DMA 50":   "YES" if s.aboveDMA50  else "NO",
+            "DMA 100 (₹)":    s.dma100,
+            "Above DMA 100":  "YES" if s.aboveDMA100 else "NO",
+            "DMA 200 (₹)":    s.dma200,
+            "Above DMA 200":  "YES" if s.aboveDMA200 else "NO",
+            "% vs DMA 200":   s.pctAboveDMA200,
+            "DMA 200 Alert":  "⚠ OVEREXTENDED (>10%)" if s.dma200Alert=="OVEREXTENDED" else "✓ Within Range",
+            "Signal":         s.signal,
         })
+
     out_df = pd.DataFrame(rows)
     os.makedirs(DOCS_DIR, exist_ok=True)
-    arc    = os.path.join(DOCS_DIR, "archive")
+    arc = os.path.join(DOCS_DIR, "archive")
     os.makedirs(arc, exist_ok=True)
-    dated  = os.path.join(arc, f"NSE_DMA_Screener_{today.strftime('%Y-%m-%d')}.xlsx")
-    latest = os.path.join(DOCS_DIR, "latest.xlsx")
+
+    date_str = datetime.today().strftime("%Y-%m-%d")
+    dated    = os.path.join(arc,      f"NSE_DMA_Screener_{date_str}.xlsx")
+    latest   = os.path.join(DOCS_DIR, "latest.xlsx")
 
     def write(path):
         with pd.ExcelWriter(path, engine="openpyxl") as w:
             out_df.to_excel(w, sheet_name="All Nifty 250", index=False)
             out_df[out_df.Signal.isin(["BUY","HOLD","OVEREXTENDED"])].to_excel(
                 w, sheet_name="Screened", index=False)
-            out_df[out_df.Signal=="BUY"].to_excel(w, sheet_name="BUY Signals", index=False)
+            out_df[out_df.Signal == "BUY"].to_excel(
+                w, sheet_name="BUY Signals", index=False)
         wb = load_workbook(path)
-        for ws in wb.worksheets: _fmt(ws)
+        for ws in wb.worksheets:
+            _fmt_sheet(ws)
         wb.save(path)
 
     write(dated)
-    import shutil; shutil.copy(dated, latest)
+    import shutil
+    shutil.copy(dated, latest)
     print(f"  ✓ Excel → {latest}")
+    print(f"  ✓ Archive → {dated}")
 
-def _fmt(ws):
+def _fmt_sheet(ws):
     thin = Side(style="thin", color="D0D0D0")
     bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
     for cell in ws[1]:
         cell.fill = PatternFill("solid", fgColor=CLR["header"])
         cell.font = Font(bold=True, color="FFFFFF", size=10)
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
-    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[1].height = 30
     for col in ws.columns:
         mw = max((len(str(c.value or "")) for c in col), default=10)
-        ws.column_dimensions[get_column_letter(col[0].column)].width = min(mw+4, 22)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(mw + 4, 24)
     hdrs = {c.value: c.column for c in ws[1]}
-    SC   = {"BUY":CLR["buy"],"HOLD":CLR["hold"],"OVEREXTENDED":CLR["over"],"WATCH":CLR["watch"]}
+    SC   = {"BUY": CLR["buy"], "HOLD": CLR["hold"],
+            "OVEREXTENDED": CLR["over"], "WATCH": CLR["watch"]}
     for row in ws.iter_rows(min_row=2):
         for cell in row:
-            cell.border = bdr
+            cell.border    = bdr
             cell.alignment = Alignment(horizontal="right")
-        for col_name in ["Above DMA 50","Above DMA 100","Above DMA 200"]:
+        for col_name in ["Above DMA 50", "Above DMA 100", "Above DMA 200"]:
             ci = hdrs.get(col_name)
             if ci:
                 c = row[ci-1]
-                c.fill = PatternFill("solid", fgColor=(CLR["yes"] if c.value=="YES" else CLR["no"]))
+                c.fill = PatternFill("solid",
+                    fgColor=(CLR["yes"] if c.value == "YES" else CLR["no"]))
                 c.font = Font(bold=True)
         ci = hdrs.get("Signal")
         if ci:
@@ -363,7 +354,8 @@ def _fmt(ws):
         ci = hdrs.get("DMA 200 Alert")
         if ci:
             c = row[ci-1]
-            c.fill = PatternFill("solid", fgColor=(CLR["over"] if "OVER" in str(c.value) else CLR["buy"]))
+            c.fill = PatternFill("solid",
+                fgColor=(CLR["over"] if "OVER" in str(c.value) else CLR["buy"]))
             c.font = Font(bold=True)
         ci = hdrs.get("Change (%)")
         if ci:
@@ -371,26 +363,37 @@ def _fmt(ws):
             try:
                 v = float(c.value)
                 c.font = Font(color=("375623" if v >= 0 else "9C0006"), bold=True)
-            except: pass
+            except:
+                pass
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run():
-    print("="*60)
-    print("  NSE Nifty 250 Daily DMA Screener")
-    print(f"  {datetime.now().strftime('%d %b %Y %H:%M')}")
-    print("="*60)
-    today = last_trading_day()
-    print(f"\n[1/4] Trading day: {today.strftime('%d %b %Y (%A)')}")
-    price_df, session = build_history(today, days=210)
-    result_df = screen(today, price_df, session)
-    print("\n[4/4] Exporting…")
-    export_json(result_df, today)
-    export_excel(result_df, today)
-    print("\n" + "="*60)
-    print("  ✅ Done!")
-    print("="*60)
+    print("=" * 60)
+    print("  NSE Nifty 250 Daily DMA Screener (yfinance)")
+    print(f"  {datetime.now().strftime('%d %b %Y %H:%M UTC')}")
+    print("=" * 60)
+
+    all_close, all_volume, all_today = fetch_all_data()
+
+    if not all_today:
+        print("\n✗ FATAL: No data fetched. Exiting.")
+        raise SystemExit(1)
+
+    result_df = screen(all_close, all_volume, all_today)
+
+    if result_df.empty:
+        print("\n✗ FATAL: Screening produced no results. Exiting.")
+        raise SystemExit(1)
+
+    print("\n[3/3] Exporting…")
+    export_json(result_df)
+    export_excel(result_df)
+
+    print("\n" + "=" * 60)
+    print("  ✅ ALL DONE!")
+    print("=" * 60)
 
 if __name__ == "__main__":
     run()
