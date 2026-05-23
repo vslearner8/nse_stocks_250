@@ -1,13 +1,9 @@
-# .github/workflows/nse_screener.yml
-# Runs at 4:15 PM IST (10:45 UTC) Mon–Fri AUTOMATICALLY
-# Publishes live dashboard to: https://vslearner8.github.io/nse_stocks_250/
-
 name: NSE Daily Screener
 
 on:
   schedule:
-    - cron: "45 10 * * 1-5"
-  workflow_dispatch:
+    - cron: "45 10 * * 1-5"   # 4:15 PM IST every weekday
+  workflow_dispatch:            # Manual trigger anytime
 
 permissions:
   contents: write
@@ -21,7 +17,7 @@ jobs:
 
     steps:
 
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -32,35 +28,35 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Restore bhavcopy history cache
-        uses: actions/cache@v4
-        with:
-          path: ./nse_history
-          key: nse-history-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            nse-history-${{ runner.os }}-
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas openpyxl
+          pip install yfinance pandas openpyxl requests
 
-      - name: Run NSE DMA Screener
+      - name: Run screener
         run: python nse_daily_screener.py
 
-      - name: Copy dashboard HTML to docs/
+      - name: Copy index.html to docs/
         run: |
           mkdir -p docs
           cp index.html docs/index.html
 
-      - name: Commit and push updated docs/
+      - name: Verify output files exist
+        run: |
+          echo "=== docs/ contents ==="
+          ls -lh docs/
+          echo "=== JSON preview (first 500 chars) ==="
+          head -c 500 docs/screener_data.json
+          echo ""
+
+      - name: Commit and push docs/
         run: |
           git config user.name  "NSE Screener Bot"
           git config user.email "bot@nse-screener.local"
           git add docs/
           git status
-          git diff --staged --quiet || git commit -m "data: update screener $(date +'%Y-%m-%d %H:%M IST')"
-          git push origin main
+          git diff --staged --quiet || git commit -m "data: screener update $(date +'%Y-%m-%d %H:%M')"
+          git push origin HEAD
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -71,10 +67,5 @@ jobs:
           publish_dir: ./docs
           publish_branch: gh-pages
           keep_files: true
+          commit_message: "deploy: screener $(date +'%Y-%m-%d')"
 
-      - name: Save bhavcopy history cache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: ./nse_history
-          key: nse-history-${{ runner.os }}-${{ github.run_id }}
